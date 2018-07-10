@@ -14,3 +14,6 @@ Align to known variants:<br/>
     List of 15nt sequences containing variant candidates at center postion<br/>
     <br/>
 Train using the high confidence calls on chromosome 21 and test on chromosome 22
+<br/><br/>
+Based on VariantNet: https://github.com/pb-jchin/VariantNET<br/>
+Modified to run on Clusterone<br/>
