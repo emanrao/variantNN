@@ -21,370 +21,365 @@ Two convolution + maxpool layers
 Three fully connected layers. 
 
 The output layer contains two group of outputs, each a 4x array. 
- - Base Identity in [A C G T] coding
- - Variant type [het, hom, non-var, other-var] ( Use a softmax layer and cross-entropy for the loss)
-
+ - Base Identity in [A C G T] 
+ - Variant type [het, hom, non-var, other-var] 
+ 
 Based on VariantNet: https://github.com/pb-jchin/VariantNET
-Modified to run on Clusterone
+Modified to run on Clusterone (distributed task with Tensorboard monitoring)
 """
 
-from __future__ import print_function
-import sys
 import os
-import intervaltree
-import numpy as np
-import random
+import logging
 import tensorflow as tf
+import numpy as np
+import intervaltree
+import random
+from clusterone import get_data_path, get_logs_path
 
-#%% Read Training Data
-def get_training_array( aln_tensor_fn, variant_set_fn, mask_bed_fn ):
-    base2num = dict(zip("ACGT",(0, 1, 2, 3)))
-    # Load BED data into interval tree
-    tree =  intervaltree.IntervalTree()
-    with open(mask_bed_fn) as f:
-        for row in f:
-            row = row.strip().split()
-            b = int(row[1]) # beginning coordinate
-            e = int(row[2]) # end coordinate
-            tree.addi(b, e, None)
-    # Load variants (Labels)
-    Y_intitial = {}
-    with open( variant_set_fn ) as f:
-        for row in f:
-            row = row.strip().split()
-            if row[3] == "0":  # Het base
-                het = True
-            else:
-                het = False
-            
-            pos = int(row[0])
-            if len(tree.search(pos)) == 0: # not included in BED file
-                continue
-            base_vec = [0,0,0,0,0,0,0,0]  #[A(0) C(1) G(2) T(3) het(4) hom(5) non-variant(6) non-SNP(7)]
-            if het: # split coverage over 2 bases
-                base_vec[base2num[row[1][0]]] = 0.5
-                base_vec[base2num[row[2][0]]] = 0.5
-                base_vec[4] = 1.
-            else: # homo base
-                base_vec[base2num[row[2][0]]] = 1
-                base_vec[5] = 1.
+from read_data import *
+from model import *
 
-            if len(row[1]) > 1 or len(row[2]) > 1 :  # not simple SNP case
-                base_vec[7] = 1.
-                base_vec[4] = 0.
-                base_vec[5] = 0.
-        
-            Y_intitial[pos] = base_vec
-            
-    Y_pos = sorted(Y_intitial.keys())
-    cpos = Y_pos[0]
-    for pos in Y_pos[1:]: #consider variants w/in 12 bases as non-SNPs
-        if abs(pos - cpos) < 12:
-            Y_intitial[pos][7] = 1
-            Y_intitial[cpos][7] = 1
-            
-            Y_intitial[pos][4] = 0
-            Y_intitial[cpos][4] = 0
-            Y_intitial[pos][5] = 0
-            Y_intitial[cpos][5] = 0
-        cpos = pos
+#%% User defined variables
+CLUSTERONE_USERNAME = "emanrao"
 
-    X_intitial = {}  
-    # Load alignment data (Features)
-    with open( aln_tensor_fn ) as f:
-        for row in f:
-            row = row.strip().split()
-            pos = int(row[0]) #coordinate
-            if len(tree.search(pos)) == 0: # check if included in BED
-                continue
-            ref_seq = row[1] # reference sequence
-            if ref_seq[7] not in ["A","C","G","T"]: # non-standard center base
-                continue
-            vec = np.reshape(np.array([float(x) for x in row[2:]]), (15,3,4))
-
-            vec = np.transpose(vec, axes=(0,2,1))
-            if sum(vec[7,:,0]) < 5:
-                continue
-            
-            vec[:,:,1] -= vec[:,:,0] # subtract matrix 0 from 1 and 2
-            vec[:,:,2] -= vec[:,:,0]
-
-            
-            X_intitial[pos] = vec
-            
-            if pos not in Y_intitial: # add corrdinate to Y_initial
-                base_vec = [0,0,0,0,0,0,0,0]
-                base_vec[base2num[ref_seq[7]]] = 1 # take center base from read
-                base_vec[6] = 1. # set as non variant
-                Y_intitial[pos] = base_vec
-                
-    all_pos = sorted(X_intitial.keys())
-    random.shuffle(all_pos)
-
-    Xarray = [] # Save array in random order (reads shuffled)
-    Yarray = []
-    pos_array = []
-    for pos in all_pos:
-        Xarray.append(X_intitial[pos])
-        Yarray.append(Y_intitial[pos])
-        pos_array.append(pos)
-    Xarray = np.array(Xarray)
-    Yarray = np.array(Yarray)
-
-    return Xarray, Yarray, pos_array
-
-def get_batch(X, Y, size=100): # Take random sample of data
-    s = random.randint(0,len(X)-size)
-    return X[s:s+size], Y[s:s+size]
-
-def get_aln_array( aln_tensor_fn ):
-
-    X_intitial = {}  
-
-    with open( aln_tensor_fn ) as f:
-        for row in f:
-            row = row.strip().split()
-            pos = int(row[0])  # coordinate
-            ref_seq = row[1] # reference sequence
-            ref_seq = ref_seq.upper()
-
-            if ref_seq[7] not in ["A","C","G","T"]:  #non-standard base at center
-                continue
-
-            vec = np.reshape(np.array([float(x) for x in row[2:]]), (15,3,4))
-
-            vec = np.transpose(vec, axes=(0,2,1))
-            if sum(vec[7,:,0]) < 5:
-                continue
-            
-            vec[:,:,1] -= vec[:,:,0]
-            vec[:,:,2] -= vec[:,:,0]
-            
-            X_intitial[pos] = vec
-                
-    all_pos = sorted(X_intitial.keys())
-
-    Xarray = []
-    pos_array = []
-    for pos in all_pos:
-        Xarray.append(X_intitial[pos])
-        pos_array.append(pos)
-    Xarray = np.array(Xarray)
-
-    return Xarray, pos_array
-
-#%% Variant Caller
-class VariantNN(object):
-
-    def __init__(self, input_shape = (15, 4, 3),
-                       output_shape1 = (4, ),
-                       output_shape2 = (4, ),
-                       kernel_size1 = (2, 4),
-                       kernel_size2 = (3, 4),
-                       poll_size1 = (7, 1),
-                       poll_size2 = (3, 1),
-                       filter_num = 48,
-                       hidden_layer_unit_number = 48):
-        self.input_shape = input_shape
-        self.output_shape1 = output_shape1
-        self.output_shape2 = output_shape2
-        self.kernel_size1 = kernel_size1
-        self.kernel_size2 = kernel_size2
-        self.poll_size1 = poll_size1
-        self.poll_size2 = poll_size2
-        self.filter_num = filter_num
-        self.hidden_layer_unit_number = hidden_layer_unit_number
-        self.g = tf.Graph()
-        self._build_graph()
-        self.session = tf.Session(graph = self.g)
-
-
-    def _build_graph(self):
-        with self.g.as_default():
-            X_in = tf.placeholder(tf.float32, [None, self.input_shape[0],
-                                                     self.input_shape[1],
-                                                     self.input_shape[2]])
-
-            Y_out = tf.placeholder(tf.float32, [None, self.output_shape1[0] + self.output_shape2[0]])
-
-            self.X_in = X_in
-            self.Y_out = Y_out
-            # Concolution + MaxPool Layer 1
-            conv1 = tf.layers.conv2d(
-                inputs=X_in,
-                filters=self.filter_num,
-                kernel_size=self.kernel_size1,
-                padding="same",
-                activation=tf.nn.elu)
-            pool1 = tf.layers.max_pooling2d(inputs=conv1, pool_size=self.poll_size1, strides=1)
-            # Concolution + MaxPool Layer 2
-            conv2 = tf.layers.conv2d(
-                inputs=pool1,
-                filters=self.filter_num,
-                kernel_size=self.kernel_size2,
-                padding="same",
-                activation=tf.nn.elu)
-            pool2 = tf.layers.max_pooling2d(inputs=conv2, pool_size=self.poll_size2, strides=1)
-
-            flat_size = ( 15 - (self.poll_size1[0] - 1) - (self.poll_size2[0] - 1))
-            flat_size *= ( 4 - (self.poll_size1[1] - 1) - (self.poll_size2[1] - 1))
-            flat_size *= self.filter_num
-
-            conv2_flat =  tf.reshape(pool2, [-1,  flat_size])
-            # Fully Connected + Dropout Layer 1
-            unit_num = self.hidden_layer_unit_number
-            h1 = tf.layers.dense(inputs=conv2_flat, units=unit_num, activation=tf.nn.elu)
-            dropout1 = tf.layers.dropout(inputs=h1, rate=0.50)
-            # Fully Connected + Dropout Layer 2
-            h2 = tf.layers.dense(inputs=dropout1, units=unit_num, activation=tf.nn.elu)
-            dropout2 = tf.layers.dropout(inputs=h2, rate=0.50)
-            # Fully Connected + Dropout Layer 3
-            h3 = tf.layers.dense(inputs=dropout2, units=unit_num, activation=tf.nn.elu)
-            dropout3 = tf.layers.dropout(inputs=h3, rate=0.50)
-
-
-            Y1 = tf.layers.dense(inputs=dropout3, units=self.output_shape1[0], activation=tf.nn.sigmoid)
-            Y2 = tf.layers.dense(inputs=dropout3, units=self.output_shape2[0], activation=tf.nn.elu)
-            Y3 = tf.nn.softmax(Y2)
-
-            self.Y1 = Y1
-            self.Y3 = Y3
-
-            loss = tf.reduce_sum(  tf.pow( Y1 - tf.slice(Y_out,[0,0],[-1,self.output_shape1[0]] ), 2) )  +\
-                   tf.reduce_sum(  tf.nn.softmax_cross_entropy_with_logits( logits=Y2,
-                                                                            labels=tf.slice( Y_out, [0,self.output_shape1[0]],
-                                                                                                    [-1,self.output_shape2[0]] ) ) )
-            self.loss = loss
-            learning_rate = 0.0005
-            optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-            training_op = optimizer.minimize(loss)
-            self.training_op = training_op
-            self.init_op = tf.global_variables_initializer()
-
-    def init(self):
-        self.session.run( self.init_op )
-
-    def close(self):
-        self.session.close()
-
-    def train(self, batchX, batchY):
-        loss = 0
-        X_in = self.X_in
-        Y_out = self.Y_out
-        loss, _ = self.session.run( (self.loss, self.training_op), feed_dict={X_in:batchX, Y_out:batchY})
-        return loss
-
-    def get_loss(self, batchX, batchY):
-        loss = 0
-        X_in = self.X_in
-        Y_out = self.Y_out
-        loss  = self.session.run( self.loss, feed_dict={X_in:batchX, Y_out:batchY})
-        return loss
-
-    def save_parameters(self, fn):
-        with self.g.as_default():
-            self.saver = tf.train.Saver()
-            self.saver.save(self.session, fn)
-
-    def restore_parameters(self, fn):
-        with self.g.as_default():
-            self.saver = tf.train.Saver()
-            self.saver.restore(self.session, fn)
-
-    def predict(self, Xarray):
-        with self.g.as_default():
-            bases_, type_  = self.session.run( (self.Y1, self.Y3), feed_dict={self.X_in:Xarray})
-            return bases_, type_
-
-    def __del__(self):
-        self.session.close()
-
-#%% Main Script - Train Model
 try: script_dir = os.path.dirname(__file__)
 except:script_dir = os.getcwd()
 
-aln_tensor_fn = os.path.join(script_dir,"data/aln_tensor_chr21")
-variant_set_fn = os.path.join(script_dir,"data/variants_chr21")
-mask_bed_fn = os.path.join(script_dir,"data/testing_data/chr21/CHROM21_v.3.3.2_highconf_noinconsistent.bed") 
-parameter_folder = os.path.join(script_dir,"data/parameters")
+LOCAL_LOG_LOCATION = os.path.join(script_dir,"logs")
+if not os.path.exists(LOCAL_LOG_LOCATION): os.makedirs(LOCAL_LOG_LOCATION)
 
-# Read in training data
-Xarray, Yarray, pos_array = get_training_array(aln_tensor_fn, variant_set_fn, mask_bed_fn)
-if not os.path.exists(parameter_folder): os.makedirs(parameter_folder)
-
-# Train Model
-vnn = VariantNN()
-vnn.init()
-batch_size = 500
-num_epochs = 2401
-validation_lost = []
-for i in range(num_epochs):
-    Xbatch, Ybatch = get_batch(Xarray[:30000], Yarray[:30000], size=batch_size)
-    loss = vnn.train(Xbatch, Ybatch)
-    if i % (len(Xarray[:30000])/batch_size) == 0: # validate
-        v_lost = vnn.get_loss( Xarray[30000:40000], Yarray[30000:40000] )
-        print(i, "train lost:", loss/batch_size, "validation lost", v_lost/10000)
-        vnn.save_parameters(parameter_folder +'/vn.params-%04d' % i)
-        validation_lost.append( (v_lost, i) )
-# pick parameter set with lowest validation loss
-validation_lost.sort()
-i = validation_lost[0][1]
-vnn.restore_parameters(parameter_folder +'/vn.params-%04d' % i)
-
-#%% Main Script - Test Model
-aln_tensor_fn = os.path.join(script_dir,"data/aln_tensor_chr22")
-variant_set_fn = os.path.join(script_dir,"data/variants_chr22")
-mask_bed_fn = os.path.join(script_dir,"data/testing_data/chr22/CHROM22_v.3.3.2_highconf_noinconsistent.bed") 
-
-# Read in test data
-Xarray2, Yarray2, pos_array2 = get_training_array(aln_tensor_fn, variant_set_fn, mask_bed_fn) 
-
-base, t = vnn.predict(Xarray2)
-
-evaluation_data = []
-for pos, predict_v, annotate_v in zip(np.array(pos_array2), t, Yarray2[:,4:]):
-    evaluation_data.append((pos, np.argmax(predict_v), np.argmax(annotate_v)))
-
-ed = np.array(evaluation_data)
-recall_het_any = 1.0*sum((ed[:,1]!=2) & (ed[:,2]==0))/sum(ed[:,2]==0)
-recall_het_het = 1.0*sum((ed[:,1]==0) & (ed[:,2]==0))/sum(ed[:,2]==0)
-ppv_het_any = 1.0*sum((ed[:,1]==0) & (ed[:,2]!=2))/sum(ed[:,1]==0)
-ppv_het_het = 1.0*sum((ed[:,1]==0) & (ed[:,2]==0))/sum(ed[:,1]==0)
-recall_hom_any = 1.0*sum((ed[:,1]!=2) & (ed[:,2]==1))/sum(ed[:,2]==1)
-recall_hom_hom = 1.0*sum((ed[:,1]==1) & (ed[:,2]==1))/sum(ed[:,2]==1)
-ppv_hom_any = 1.0*sum((ed[:,1]==1) & (ed[:,2]!=2))/sum(ed[:,1]==1)
-ppv_hom_hom = 1.0*sum((ed[:,1]==1) & (ed[:,2]==1))/sum(ed[:,1]==1)
-recall_total = 1.0*sum((ed[:,1]!=2) & (ed[:,2]!=2))/sum(ed[:,2]!=2)
-ppv_total = 1.0*sum((ed[:,1]!=2) & (ed[:,2]!=2))/sum(ed[:,1]!=2)
+LOCAL_DATASET_LOCATION = script_dir
+LOCAL_DATASET_NAME = "data"
 
 
+def main():
+    """
+    Identify datasets for training and testing
+    aln = Alignment data in 15x3x3 matrices for each datapoint
+    var = Expected Variants List
+    bed = Genomic coordinate information
+    """
+    
+    #Training Data
+    train_aln_filename = 'aln_tensor_chr21'
+    train_var_filename = 'variants_chr21'
+    train_bed_filename = 'CHROM21_v.3.3.2_highconf_noinconsistent.bed'
+    
+    #Validation Data
+    val = True  # Run validation set [True/False]
+    val_aln_filename = 'aln_tensor_chr22'
+    val_var_filename = 'variants_chr22'
+    val_bed_filename = 'CHROM22_v.3.3.2_highconf_noinconsistent.bed'
+    
+    # TESTING FLAG: Use small set to test code
+    test_script = True
+    num_test = 100
+    
+    # Training Parameters
+    batch_size = 20  # Batch size
+    num_epochs = 5  # Number epochs
+    train_holdout = 0.2  # Portion of training features used for valisation
+    learning_rate = 0.005  # Starting learning rate
+    steps_per_epoch = 10 # Number of training steps per epoch
+    
+    #%%
+    # Create logging
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
 
-print("Recall rate for het-call (regardless called variant types): {:.2f}".format(recall_het_any))
-print("Recall rate for het-call (called variant type = het): {:2f}".format(recall_het_any))
 
-print("PPV for het-call (regardless called variant types): {:.2f}".format(recall_het_any))
-print("PPV for het-call (called variant type = het): {:2f}".format(recall_het_any))
+    # Get environment variables
+    try:
+        job_name = os.environ['JOB_NAME']
+        task_index = os.environ['TASK_INDEX']
+        ps_hosts = os.environ['PS_HOSTS']
+        worker_hosts = os.environ['WORKER_HOSTS']
+    except:
+        job_name = None
+        task_index = 0
+        ps_hosts = None
+        worker_hosts = None
+        
+    # Get local file paths
+    if job_name == None: #if running locally
+        if LOCAL_LOG_LOCATION == "...":
+            raise ValueError("LOCAL_LOG_LOCATION needs to be defined")
+        if LOCAL_DATASET_LOCATION == "...":
+            raise ValueError("LOCAL_DATASET_LOCATION needs to be defined")
+        if LOCAL_DATASET_NAME == "...":
+            raise ValueError("LOCAL_DATASET_NAME needs to be defined")
 
-print("Recall rate for hom-call (regardless called variant types): {:.2f}".format(recall_het_any))
-print("Recall rate for hom-call (called variant type = hom): {:.2f}".format(recall_het_any))
+    PATH_TO_LOCAL_LOGS = os.path.expanduser(LOCAL_LOG_LOCATION)
+    ROOT_PATH_TO_LOCAL_DATA = os.path.expanduser(LOCAL_DATASET_LOCATION)
+   
+    # Flags
+    flags = tf.app.flags
+    FLAGS = flags.FLAGS
 
-print("PPV for hom-call (regardless called variant types): {:.2f}".format(recall_het_any))
-print("PPV for hom-call (called variant type = hom): {:.2f}".format(recall_het_any))
+    # Flags for environment variables
+    flags.DEFINE_string("job_name", job_name,
+                        "job name: worker or ps")
+    flags.DEFINE_integer("task_index", task_index,
+                         "Worker task index, should be >= 0. task_index=0 is "
+                         "the chief worker task that performs the variable "
+                         "initialization and checkpoint handling")
+    flags.DEFINE_string("ps_hosts", ps_hosts,
+                        "Comma-separated list of hostname:port pairs")
+    flags.DEFINE_string("worker_hosts", worker_hosts,
+                        "Comma-separated list of hostname:port pairs")
+    
+    # Training file flags
+    flags.DEFINE_string("train_aln",
+                        get_data_path(
+                            dataset_name = "emanrao/variantNN/"+train_aln_filename,
+                            local_root = ROOT_PATH_TO_LOCAL_DATA,
+                            local_repo = LOCAL_DATASET_NAME,
+                            path = train_aln_filename
+                            ),
+                        "Path to training dataset (short reads).")
+    flags.DEFINE_string("train_var",
+                        get_data_path(
+                            dataset_name = "emanrao/variantNN/"+train_var_filename,
+                            local_root = ROOT_PATH_TO_LOCAL_DATA,
+                            local_repo = LOCAL_DATASET_NAME,
+                            path = train_var_filename
+                            ),
+                        "Path to variants for training dataset.")
+    flags.DEFINE_string("train_bed",
+                        get_data_path(
+                            dataset_name = "emanrao/variantNN/"+train_bed_filename,
+                            local_root = ROOT_PATH_TO_LOCAL_DATA,
+                            local_repo = LOCAL_DATASET_NAME,
+                            path = train_bed_filename
+                            ),
+                        "Path to bed file for training dataset.")
+    
+    flags.DEFINE_string("log_dir",
+                         get_logs_path(root=PATH_TO_LOCAL_LOGS),
+                         "Path to store logs and checkpoints.")
+    
+    # Validation file flags
+    flags.DEFINE_string("test_aln",
+                        get_data_path(
+                            dataset_name = "emanrao/variantNN/"+val_aln_filename,
+                            local_root = ROOT_PATH_TO_LOCAL_DATA,
+                            local_repo = LOCAL_DATASET_NAME,
+                            path = val_aln_filename
+                            ),
+                        "Path to testing dataset (short reads).")
+    flags.DEFINE_string("test_var",
+                        get_data_path(
+                            dataset_name = "emanrao/variantNN/"+val_var_filename,
+                            local_root = ROOT_PATH_TO_LOCAL_DATA,
+                            local_repo = LOCAL_DATASET_NAME,
+                            path = val_var_filename
+                            ),
+                        "Path to variants for testing dataset.")
+    flags.DEFINE_string("test_bed",
+                        get_data_path(
+                            dataset_name = "emanrao/variantNN/"+val_bed_filename,
+                            local_root = ROOT_PATH_TO_LOCAL_DATA,
+                            local_repo = LOCAL_DATASET_NAME,
+                            path = val_bed_filename
+                            ),
+                        "Path to bed file for testing dataset.")
 
-print("Recall rate for all calls: {:.2f}".format(recall_het_any))
-print("PPV for all calls: {:.2f}".format(recall_het_any))
+    # Training parameter flags
+    flags.DEFINE_integer("batch_size", batch_size,
+                        "Batch size [100].")
+    flags.DEFINE_integer("num_epochs", num_epochs,
+                        "Number epochs [50].")
+    flags.DEFINE_float("train_holdout", train_holdout,
+                        "Portion of training features withheld from traing and used for validation [0.2].")
+    flags.DEFINE_float("learning_rate", learning_rate,
+                        "Starting learning rate [0.0005].")
+    flags.DEFINE_integer("steps_per_epoch", steps_per_epoch, 
+                         "Number of training steps per epoch")
 
-Xarray3, pos_array3 = get_aln_array(aln_tensor_fn)
+    # Configure Distributed Environment
+    def device_and_target():
+        # If FLAGS.job_name is not set, we're running single-machine TensorFlow.
+        # Don't set a device.
+        if FLAGS.job_name is None:
+            print("Running single-machine training")
+            return (None, "")
 
-all_t = []
-for i in range(0, len(Xarray3), 10000):
-    base, t = vnn.predict(Xarray3[i:i+10000])
-    all_t.append(t)
-all_t = np.concatenate(all_t)
-evaluation_data2 = []
-for pos, predict_v in zip(np.array(pos_array3), all_t):
-    evaluation_data2.append((pos, np.argmax(predict_v)))
-evaluation_data2 = np.array(evaluation_data2)
+        # Otherwise we're running distributed TensorFlow.
+        print("Running distributed training")
+        if FLAGS.task_index is None or FLAGS.task_index == "":
+            raise ValueError("Must specify an explicit `task_index`")
+        if FLAGS.ps_hosts is None or FLAGS.ps_hosts == "":
+            raise ValueError("Must specify an explicit `ps_hosts`")
+        if FLAGS.worker_hosts is None or FLAGS.worker_hosts == "":
+            raise ValueError("Must specify an explicit `worker_hosts`")
 
-print("Total number of variant from the high-confident short-read call-set: ", sum(ed[:,1]!=2))
-print("Total number of variant calls from our chr22 data: ", sum(evaluation_data2[:,1] !=
+        cluster_spec = tf.train.ClusterSpec({
+                "ps": FLAGS.ps_hosts.split(","),
+                "worker": FLAGS.worker_hosts.split(","),
+        })
+        server = tf.train.Server(
+                cluster_spec, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
+        if FLAGS.job_name == "ps":
+            server.join()
+
+        worker_device = "/job:worker/task:{}".format(FLAGS.task_index)
+        # The device setter will automatically place Variables ops on separate
+        # parameter servers (ps). The non-Variable ops will be placed on the workers.
+        return (
+                tf.train.replica_device_setter(
+                        worker_device=worker_device,
+                        cluster=cluster_spec),
+                server.target,
+        )
+
+    device, target = device_and_target()
+
+#%% Read Data    
+    # Check Flags
+    if FLAGS.log_dir is None or FLAGS.log_dir == "":
+        raise ValueError("Must specify an explicit `log_dir`")
+    if FLAGS.train_aln is None or FLAGS.train_aln == "":
+        raise ValueError("Must specify an explicit `train_aln`")
+    if FLAGS.train_var is None or FLAGS.train_var == "":
+        raise ValueError("Must specify an explicit `train_var`")
+    if FLAGS.train_bed is None or FLAGS.train_bed == "":
+        raise ValueError("Must specify an explicit `train_bed`")
+    if FLAGS.test_aln is None or FLAGS.test_aln == "": val = False
+    if FLAGS.test_var is None or FLAGS.test_var == "": val = False
+    if FLAGS.test_bed is None or FLAGS.test_bed == "": val = False
+        
+    print('Training alignment file: ', FLAGS.train_aln)
+    print('Training variant file: ', FLAGS.train_var)
+    print('Training BED file: ', FLAGS.train_bed)
+    if val:
+        print('Validation alignment file: ', FLAGS.test_aln)
+        print('Validation variant file: ', FLAGS.test_var)
+        print('Validation BED file: ', FLAGS.test_bed)
+    print('Log Files Saved To: ', FLAGS.log_dir)
+
+    # Read in training data
+    if FLAGS.task_index == 0:
+        print("Looking for training data in %s" % FLAGS.train_aln)        
+    Xtrain, Ytrain, pos_train = get_training_array(FLAGS.train_aln, FLAGS.train_var, FLAGS.train_bed)
+    if test_script:
+        Xtrain = Xtrain[:num_test]
+        Ytrain = Ytrain[:num_test]
+        pos_train = Xtrain[:num_test]
+        
+    # Read in validation data    
+    if val:
+        Xtest, Ytest, pos_test = get_training_array(FLAGS.test_aln, FLAGS.test_var, FLAGS.test_bed)
+        if test_script:
+            Xtest = Xtrain[:num_test]
+            Ytest = Ytrain[:num_test]
+            pos_test = Xtrain[:num_test]
+    
+    num_train = int(np.round(Xtrain.shape[0] * (1-FLAGS.train_holdout)))
+    num_held = int(Xtrain.shape[0]-num_train)
+    print('Training on {:d} features'.format(num_train))
+    print('Testing on {:d} features'.format(num_held)) 
+    Xval = Xtrain[num_train:]
+    Yval = Ytrain[num_train:]
+    Xtrain = Xtrain[:num_train]
+    Ytrain = Ytrain[:num_train]
+    
+    num_batches = int(np.floor(Ytrain.shape[0]/FLAGS.batch_size))
+    if num_batches==0: 
+        num_batches=1
+        FLAGS.batch_size = Ytrain.shape[0]
+
+#%% Define Graph
+
+    tf.reset_default_graph()
+    with tf.device(device):            
+#        X_in = tf.placeholder(tf.float32, [None, 15, 4, 3])
+#        Y_out = tf.placeholder(tf.float32, [None, 8])
+        global_step = tf.train.get_or_create_global_step()
+
+        # Create Datasets
+        train_dataset = tf.data.Dataset.from_tensor_slices((Xtrain, Ytrain))
+#        train_dataset = train_dataset.shuffle(buffer_size=10000)
+        train_dataset = train_dataset.batch(FLAGS.batch_size)
+#        train_dataset = train_dataset.repeat(FLAGS.num_epochs)
+        
+        val_dataset = tf.data.Dataset.from_tensor_slices((Xval, Yval))
+        val_dataset = val_dataset.batch(Yval.shape[0])
+#        val_dataset = val_dataset.repeat(FLAGS.num_epochs)
+
+        test_dataset = tf.data.Dataset.from_tensor_slices((Xtest, Ytest))
+        test_dataset = test_dataset.batch(FLAGS.batch_size)
+
+        # Create Iterator
+        iter = tf.data.Iterator.from_structure(train_dataset.output_types,
+                                           train_dataset.output_shapes)
+        features, labels = iter.get_next()
+        
+        # Create initialisation operations
+        train_init_op = iter.make_initializer(train_dataset)
+        val_init_op = iter.make_initializer(val_dataset)
+        test_init_op = iter.make_initializer(test_dataset)
+        
+        # Apply model
+        with tf.name_scope('predictions'):
+            predictions = get_model(features, FLAGS)
+        with tf.name_scope('loss'):    
+            loss = get_loss(predictions,labels)
+        loss_summary = tf.summary.scalar('loss', loss)#add to tboard
+         
+        with tf.name_scope('train'):
+            train_step = (
+                tf.train.AdamOptimizer(FLAGS.learning_rate)
+                .minimize(loss, global_step=global_step)
+                )
+            
+#%% Train Model with periodic validation
+    def run_train_epoch(target, FLAGS, epoch_index):
+        print('Epoch {:d} Training...'.format(epoch_index))
+        i=1
+        hooks=[tf.train.StopAtStepHook(last_step=FLAGS.steps_per_epoch*epoch_index)] # Increment number of required training steps
+        
+        with tf.train.MonitoredTrainingSession(
+                master=target,
+                is_chief=(FLAGS.task_index == 0),
+                checkpoint_dir=FLAGS.log_dir,
+                hooks = hooks
+                ) as sess:
+ 
+            while not sess.should_stop():
+                sess.run(train_init_op) # switch to train dataset
+                _, current_loss = sess.run([train_step, loss])
+                iteration = (epoch_index)*FLAGS.steps_per_epoch + i
+                print("Iteration {}  Training Loss: {:.4f}".format(iteration,current_loss))
+                i += 1
+
+                if i==FLAGS.steps_per_epoch: # validate on last session
+                    sess.run(val_init_op) # switch to val dataset
+                    while True:
+                        try: # run and save validation parameters
+                            v_loss = sess.run(loss)
+                        except tf.errors.OutOfRangeError:
+                            break
+        print("Epoch {}  Validation Loss: {:.4f}".format(epoch_index, v_loss))
+        chk = tf.train.latest_checkpoint(FLAGS.log_dir)
+        return v_loss, chk
+     
+    validation_loss=[]
+    for e in range(1,FLAGS.num_epochs+1):
+        v_loss, chk = run_train_epoch(target, FLAGS,e)
+        validation_loss.append( (v_loss, chk) )
+    
+    # Identify best parameters
+    validation_loss.sort()
+    chkpt = validation_loss[0][1]
+    
+#%% Test Model on Different Dataset  
+    with tf.Session() as sess:   
+        tf.train.Saver().restore(sess, chkpt)
+        sess.run(test_init_op) # initialize to test dataset
+        loss = sess.run(loss)
+    print("Test Set Loss: {:.4f}".format(loss))
+
+    
+if __name__ == "__main__":
+    main()
+    
